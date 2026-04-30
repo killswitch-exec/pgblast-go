@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
@@ -371,6 +372,65 @@ func isPortOpen(host string, port int, timeout time.Duration) bool {
 	return true
 }
 
+// detectTrustAuth probes the server with a randomly-generated username and password.
+// If the connection succeeds and a trivial query runs, the server is not actually
+// validating credentials (likely 'trust' authentication in pg_hba.conf, or an
+// equivalent misconfiguration). In that case the cartesian credential test is
+// meaningless — every credential will appear valid.
+func detectTrustAuth(host string, port int, timeout time.Duration) bool {
+	canaryUser := fmt.Sprintf("nx_%016x", rand.Int63())
+	canaryPass := fmt.Sprintf("nx_%016x", rand.Int63())
+	conn, err := dbConnect(host, port, canaryUser, canaryPass, "postgres", timeout)
+	if err != nil {
+		return false
+	}
+	defer conn.Close(context.Background())
+	_, qerr := runQuery(conn, "SELECT 1")
+	return qerr == nil
+}
+
+// scanTrustAuth records a CRITICAL trust-auth finding and runs recon as the most
+// likely existing user (postgres first, then candidates from the wordlist) so the
+// report reflects real-world exposure.
+func scanTrustAuth(ctx context.Context, host string, port int, creds []Credential, timeout time.Duration, doEnum bool, res *HostResult) {
+	res.Findings = append(res.Findings, Finding{
+		Severity: "CRITICAL",
+		Title:    "Server accepts any credential — pg_hba.conf likely uses 'trust' authentication",
+		Detail:   "Connected with a random nonexistent username and password and ran a query successfully. Anyone with network access can connect to PostgreSQL without authentication. Credential bruteforce was skipped — do not interpret the absence of a 'cracked credential list' as remediation.",
+	})
+
+	candidates := []string{"postgres"}
+	seen := map[string]bool{"postgres": true}
+	for _, c := range creds {
+		if !seen[c.User] {
+			seen[c.User] = true
+			candidates = append(candidates, c.User)
+			if len(candidates) >= 5 {
+				break
+			}
+		}
+	}
+
+	for _, u := range candidates {
+		if ctx.Err() != nil {
+			return
+		}
+		conn, err := dbConnect(host, port, u, "", "postgres", timeout)
+		if err != nil {
+			continue
+		}
+		label := u + "@<trust>"
+		res.Credentials = append(res.Credentials, Credential{User: u, Password: "<trust>"})
+		res.Recon[label] = collectRecon(conn)
+		res.Findings = append(res.Findings, checkPrivesc(conn)...)
+		closeConn(conn)
+		if doEnum {
+			res.Enumeration[label] = enumerateAccess(host, port, u, "", timeout)
+		}
+		return
+	}
+}
+
 func scanHost(ctx context.Context, host string, port int, creds []Credential, credThreads int, timeout time.Duration, doEnum bool) HostResult {
 	res := HostResult{
 		Host:        host,
@@ -383,6 +443,11 @@ func scanHost(ctx context.Context, host string, port int, creds []Credential, cr
 		return res
 	}
 	res.Open = true
+
+	if detectTrustAuth(host, port, timeout) {
+		scanTrustAuth(ctx, host, port, creds, timeout, doEnum, &res)
+		return res
+	}
 
 	// Phase 1: test credentials concurrently, stop probing a user once one password works.
 	// Skipping further attempts on a cracked user avoids redundant work and prevents
