@@ -372,63 +372,10 @@ func isPortOpen(host string, port int, timeout time.Duration) bool {
 	return true
 }
 
-// detectTrustAuth probes the server with a randomly-generated username and password.
-// If the connection succeeds and a trivial query runs, the server is not actually
-// validating credentials (likely 'trust' authentication in pg_hba.conf, or an
-// equivalent misconfiguration). In that case the cartesian credential test is
-// meaningless — every credential will appear valid.
-func detectTrustAuth(host string, port int, timeout time.Duration) bool {
-	canaryUser := fmt.Sprintf("nx_%016x", rand.Int63())
-	canaryPass := fmt.Sprintf("nx_%016x", rand.Int63())
-	conn, err := dbConnect(host, port, canaryUser, canaryPass, "postgres", timeout)
-	if err != nil {
-		return false
-	}
-	defer conn.Close(context.Background())
-	_, qerr := runQuery(conn, "SELECT 1")
-	return qerr == nil
-}
-
-// scanTrustAuth records a CRITICAL trust-auth finding and runs recon as the most
-// likely existing user (postgres first, then candidates from the wordlist) so the
-// report reflects real-world exposure.
-func scanTrustAuth(ctx context.Context, host string, port int, creds []Credential, timeout time.Duration, doEnum bool, res *HostResult) {
-	res.Findings = append(res.Findings, Finding{
-		Severity: "CRITICAL",
-		Title:    "Server accepts any credential — pg_hba.conf likely uses 'trust' authentication",
-		Detail:   "Connected with a random nonexistent username and password and ran a query successfully. Anyone with network access can connect to PostgreSQL without authentication. Credential bruteforce was skipped — do not interpret the absence of a 'cracked credential list' as remediation.",
-	})
-
-	candidates := []string{"postgres"}
-	seen := map[string]bool{"postgres": true}
-	for _, c := range creds {
-		if !seen[c.User] {
-			seen[c.User] = true
-			candidates = append(candidates, c.User)
-			if len(candidates) >= 5 {
-				break
-			}
-		}
-	}
-
-	for _, u := range candidates {
-		if ctx.Err() != nil {
-			return
-		}
-		conn, err := dbConnect(host, port, u, "", "postgres", timeout)
-		if err != nil {
-			continue
-		}
-		label := u + "@<trust>"
-		res.Credentials = append(res.Credentials, Credential{User: u, Password: "<trust>"})
-		res.Recon[label] = collectRecon(conn)
-		res.Findings = append(res.Findings, checkPrivesc(conn)...)
-		closeConn(conn)
-		if doEnum {
-			res.Enumeration[label] = enumerateAccess(host, port, u, "", timeout)
-		}
-		return
-	}
+// trustCanaryPass returns a random password unlikely to collide with any real
+// password in the wordlist or set on the server.
+func trustCanaryPass() string {
+	return fmt.Sprintf("nx_%016x", rand.Int63())
 }
 
 func scanHost(ctx context.Context, host string, port int, creds []Credential, credThreads int, timeout time.Duration, doEnum bool) HostResult {
@@ -444,21 +391,70 @@ func scanHost(ctx context.Context, host string, port int, creds []Credential, cr
 	}
 	res.Open = true
 
-	if detectTrustAuth(host, port, timeout) {
-		scanTrustAuth(ctx, host, port, creds, timeout, doEnum, &res)
-		return res
+	// Unique users in the order they appear in the credentials list.
+	var userOrder []string
+	seenUser := make(map[string]bool)
+	for _, c := range creds {
+		if !seenUser[c.User] {
+			seenUser[c.User] = true
+			userOrder = append(userOrder, c.User)
+		}
 	}
 
-	// Phase 1: test credentials concurrently, stop probing a user once one password works.
-	// Skipping further attempts on a cracked user avoids redundant work and prevents
-	// account lockout on hardened servers.
 	var foundMu sync.Mutex
-	found := make(map[string]bool)
+	found := make(map[string]bool)         // user → already cracked (skip further attempts)
+	foundCred := make(map[string]Credential) // user → credential for Phase 2 recon
 
-	validCh := make(chan Credential, credThreads)
-	credSem := make(chan struct{}, credThreads)
+	// Phase 0: per-user trust-auth canary. For each user, try one random password.
+	// If it authenticates, the server is not validating the password for that user
+	// (typically 'trust' in pg_hba.conf, or an unset password hash). Record the
+	// user and skip the password loop for them — testing the wordlist would
+	// otherwise produce a flood of bogus 'valid credential' entries.
+	var trustUsers []string
+	{
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, credThreads)
+		for _, u := range userOrder {
+			if ctx.Err() != nil {
+				break
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(user string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if ctx.Err() != nil {
+					return
+				}
+				conn, err := dbConnect(host, port, user, trustCanaryPass(), "postgres", timeout)
+				if err != nil {
+					return
+				}
+				conn.Close(context.Background())
+				foundMu.Lock()
+				found[user] = true
+				foundCred[user] = Credential{User: user, Password: "<trust>"}
+				trustUsers = append(trustUsers, user)
+				foundMu.Unlock()
+			}(u)
+		}
+		wg.Wait()
+	}
+
+	if len(trustUsers) > 0 {
+		sort.Strings(trustUsers)
+		res.Findings = append(res.Findings, Finding{
+			Severity: "CRITICAL",
+			Title:    "User(s) accept any password — trust authentication misconfiguration",
+			Detail:   fmt.Sprintf("Random passwords were accepted for: %s. The server is not validating passwords for these users (typically 'trust' in pg_hba.conf, or an unset password hash). Anyone with network access can authenticate as these roles. Password bruteforce was skipped for them to avoid producing misleading 'valid credential' lists.", strings.Join(trustUsers, ", ")),
+		})
+	}
+
+	// Phase 1: standard credential test, skipping users already cracked in Phase 0.
+	// Stop probing a user once one password works (avoids redundant work and
+	// account lockout on hardened servers).
 	var credWg sync.WaitGroup
-
+	credSem := make(chan struct{}, credThreads)
 	for _, cred := range creds {
 		if ctx.Err() != nil {
 			break
@@ -495,29 +491,39 @@ func scanHost(ctx context.Context, host string, port int, creds []Credential, cr
 				return
 			}
 			found[c.User] = true
+			foundCred[c.User] = c
 			foundMu.Unlock()
-			validCh <- c
 		}(cred)
 	}
 	credWg.Wait()
-	close(validCh)
 
-	// Phase 2: recon + privesc for each cracked user (one cred per user from Phase 1).
-	for cred := range validCh {
+	// Phase 2: recon + privesc for each cracked user (trust or password-found).
+	// Iterate userOrder for deterministic output.
+	for _, u := range userOrder {
 		if ctx.Err() != nil {
 			break
 		}
-		res.Credentials = append(res.Credentials, cred)
-		conn, err := dbConnect(host, port, cred.User, cred.Password, "postgres", timeout)
+		cred, ok := foundCred[u]
+		if !ok {
+			continue
+		}
+		// For trust users, the canary used a random password — connect with empty
+		// (any password works for them).
+		connPass := cred.Password
+		if connPass == "<trust>" {
+			connPass = ""
+		}
+		conn, err := dbConnect(host, port, u, connPass, "postgres", timeout)
 		if err != nil {
 			continue
 		}
-		label := cred.User + "@" + cred.Password
+		res.Credentials = append(res.Credentials, cred)
+		label := u + "@" + cred.Password
 		res.Recon[label] = collectRecon(conn)
 		res.Findings = append(res.Findings, checkPrivesc(conn)...)
 		closeConn(conn)
 		if doEnum {
-			res.Enumeration[label] = enumerateAccess(host, port, cred.User, cred.Password, timeout)
+			res.Enumeration[label] = enumerateAccess(host, port, u, connPass, timeout)
 		}
 	}
 	return res
