@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
@@ -234,6 +236,46 @@ func dbConnect(host string, port int, user, password, dbname string, timeout tim
 	return pgx.ConnectConfig(ctx, cfg)
 }
 
+// isAuthFailure reports whether err is a definitive PostgreSQL auth failure
+// (wrong password, invalid authorization). Any other error — connection refused,
+// reset, i/o timeout, "too many clients" — is transient and should not be
+// interpreted as "this credential is wrong".
+func isAuthFailure(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "28P01" || pgErr.Code == "28000"
+	}
+	return false
+}
+
+// dbConnectRetry wraps dbConnect with bounded retries on transient (non-auth)
+// errors. At high concurrency, servers commonly drop connections (max_connections,
+// rate limiting, kernel backpressure) and without retry these get misclassified
+// as failed credentials. Auth failures short-circuit immediately.
+func dbConnectRetry(ctx context.Context, host string, port int, user, password, dbname string, timeout time.Duration) (*pgx.Conn, error) {
+	const maxAttempts = 3
+	var last error
+	for i := 0; i < maxAttempts; i++ {
+		if i > 0 {
+			backoff := time.Duration(50*(1<<i)) * time.Millisecond
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		conn, err := dbConnect(host, port, user, password, dbname, timeout)
+		if err == nil {
+			return conn, nil
+		}
+		last = err
+		if isAuthFailure(err) {
+			return nil, err
+		}
+	}
+	return nil, last
+}
+
 func runQuery(conn *pgx.Conn, sql string) ([][]interface{}, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -302,8 +344,8 @@ func checkPrivesc(conn *pgx.Conn) []Finding {
 
 // ─── Enumeration ──────────────────────────────────────────────────────────────
 
-func enumerateAccess(host string, port int, user, password string, timeout time.Duration) DBTree {
-	conn, err := dbConnect(host, port, user, password, "postgres", timeout)
+func enumerateAccess(ctx context.Context, host string, port int, user, password string, timeout time.Duration) DBTree {
+	conn, err := dbConnectRetry(ctx, host, port, user, password, "postgres", timeout)
 	if err != nil {
 		return nil
 	}
@@ -320,7 +362,7 @@ func enumerateAccess(host string, port int, user, password string, timeout time.
 	tree := make(DBTree)
 	for _, row := range dbRows {
 		dbname, _ := row[0].(string)
-		dbConn, err := dbConnect(host, port, user, password, dbname, timeout)
+		dbConn, err := dbConnectRetry(ctx, host, port, user, password, dbname, timeout)
 		if err != nil {
 			tree[dbname] = map[string][]TableEntry{"_error": nil}
 			continue
@@ -479,7 +521,7 @@ func scanHost(ctx context.Context, host string, port int, creds []Credential, cr
 				return
 			}
 
-			conn, err := dbConnect(host, port, c.User, c.Password, "postgres", timeout)
+			conn, err := dbConnectRetry(ctx, host, port, c.User, c.Password, "postgres", timeout)
 			if err != nil {
 				return
 			}
@@ -513,7 +555,7 @@ func scanHost(ctx context.Context, host string, port int, creds []Credential, cr
 		if connPass == "<trust>" {
 			connPass = ""
 		}
-		conn, err := dbConnect(host, port, u, connPass, "postgres", timeout)
+		conn, err := dbConnectRetry(ctx, host, port, u, connPass, "postgres", timeout)
 		if err != nil {
 			continue
 		}
@@ -523,7 +565,7 @@ func scanHost(ctx context.Context, host string, port int, creds []Credential, cr
 		res.Findings = append(res.Findings, checkPrivesc(conn)...)
 		closeConn(conn)
 		if doEnum {
-			res.Enumeration[label] = enumerateAccess(host, port, u, connPass, timeout)
+			res.Enumeration[label] = enumerateAccess(ctx, host, port, u, connPass, timeout)
 		}
 	}
 	return res
@@ -888,11 +930,23 @@ func main() {
 	}
 	fmt.Printf("[*] Enumerate : %s\n\n", enumStr)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// Use signal.Notify with an explicit channel rather than signal.NotifyContext
+	// so the "[!] Interrupted —" message only fires on a real signal, not on
+	// normal program exit (NotifyContext's stop() also cancels the ctx, which
+	// previously caused the message to print at the end of every successful run).
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	go func() {
-		<-ctx.Done()
-		fmt.Fprintln(os.Stderr, "\n[!] Interrupted — finishing in-flight scans, partial results will be saved.")
+		select {
+		case <-sigCh:
+			fmt.Fprintln(os.Stderr, "\n[!] Interrupted — finishing in-flight scans, partial results will be saved.")
+			cancel()
+		case <-ctx.Done():
+			// canceled by normal program exit (defer cancel()), don't print
+		}
 	}()
 
 	// Open the JSON Lines output file once and stream each host as it finishes.
