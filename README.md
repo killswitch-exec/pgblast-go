@@ -30,7 +30,7 @@ Requires Go 1.21+. Produces a single static binary with no runtime dependencies.
 | `--cred-threads` | `16` | Concurrent credential attempts per host |
 | `--timeout` | `5` | Connection timeout in seconds |
 | `--enumerate` | off | Enumerate accessible databases, schemas, and tables per credential |
-| `--output` | — | Write full results to a JSON file |
+| `--output` | — | Stream full per-host results as JSON Lines (NDJSON) to this file |
 | `--verbose` | off | Full recon output with finding details |
 
 ### Host file format
@@ -121,6 +121,8 @@ For users flagged with trust auth, the password loop is skipped. A random-passwo
 Default output is compact — one block per compromised host. Superuser sessions are highlighted in red. All critical findings are consolidated at the end of the run.
 
 Use `--verbose` for full recon details, enumeration tree, and finding descriptions.
+
+`--output FILE` streams one JSON object per host per line (NDJSON / JSON Lines) as scans complete. Memory stays flat — per-host data is dropped after print, so the scanner is safe to run against very large target lists. Convert to a single JSON array with `jq -s '.' FILE` if you need it.
 
 ## Disclaimer
 

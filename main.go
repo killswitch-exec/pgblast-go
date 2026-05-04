@@ -753,17 +753,6 @@ func printResultVerbose(r HostResult, target string) {
 	}
 }
 
-func saveJSON(results []HostResult, path string) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	return enc.Encode(results)
-}
-
 // ─── Input parsing ────────────────────────────────────────────────────────────
 
 func parsePorts(s string) []int {
@@ -906,7 +895,34 @@ func main() {
 		fmt.Fprintln(os.Stderr, "\n[!] Interrupted — finishing in-flight scans, partial results will be saved.")
 	}()
 
-	results := make([]HostResult, 0, len(targets))
+	// Open the JSON Lines output file once and stream each host as it finishes.
+	// The full HostResult slice is NOT retained in memory — only lightweight
+	// summary state (counters + critical findings list) is kept. This keeps
+	// memory flat across very large target lists.
+	var jsonEnc *json.Encoder
+	if *outputFile != "" {
+		f, err := os.Create(*outputFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[!] Cannot open output file: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		jsonEnc = json.NewEncoder(f)
+		fmt.Printf("[*] JSON Lines report → %s\n\n", *outputFile)
+	}
+
+	type critHit struct {
+		host string
+		port int
+		user string
+		f    Finding
+	}
+	var (
+		statsProcessed   int
+		statsOpen        int
+		statsCompromised int
+		statsCriticals   []critHit
+	)
 	var mu sync.Mutex
 	sem := make(chan struct{}, *threads)
 	var wg sync.WaitGroup
@@ -921,74 +937,57 @@ func main() {
 			defer wg.Done()
 			defer func() { <-sem }()
 			result := scanHost(ctx, t.host, t.port, creds, *credThreads, timeout, *doEnum)
+
 			mu.Lock()
-			results = append(results, result)
+			statsProcessed++
+			if result.Open {
+				statsOpen++
+			}
+			if len(result.Credentials) > 0 {
+				statsCompromised++
+			}
+			for label, recon := range result.Recon {
+				if rows, ok := recon["is_superuser"]; ok && len(rows) > 0 && rows[0][0] == true {
+					user := strings.SplitN(label, "@", 2)[0]
+					statsCriticals = append(statsCriticals, critHit{result.Host, result.Port, user, Finding{
+						Severity: "CRITICAL",
+						Title:    "Superuser session — account has full database and OS-level access",
+						Detail:   fmt.Sprintf("User '%s' authenticated as PostgreSQL superuser.", user),
+					}})
+				}
+			}
+			for _, f := range result.Findings {
+				if f.Severity == "CRITICAL" {
+					user := ""
+					if len(result.Credentials) > 0 {
+						user = result.Credentials[0].User
+					}
+					statsCriticals = append(statsCriticals, critHit{result.Host, result.Port, user, f})
+				}
+			}
 			printResult(result, *verbose)
+			if jsonEnc != nil {
+				_ = jsonEnc.Encode(result)
+			}
 			mu.Unlock()
+			// `result` goes out of scope here; the GC can reclaim its recon data.
 		}(t)
 	}
 	wg.Wait()
 
-	// Summary
-	var open, compromised int
-	type critHit struct {
-		host string
-		port int
-		user string
-		f    Finding
-	}
-	var criticals []critHit
-
-	for _, r := range results {
-		if r.Open {
-			open++
-		}
-		if len(r.Credentials) > 0 {
-			compromised++
-		}
-		// Promote superuser sessions to critical findings if not already captured
-		for label, recon := range r.Recon {
-			if rows, ok := recon["is_superuser"]; ok && len(rows) > 0 && rows[0][0] == true {
-				user := strings.SplitN(label, "@", 2)[0]
-				criticals = append(criticals, critHit{r.Host, r.Port, user, Finding{
-					Severity: "CRITICAL",
-					Title:    "Superuser session — account has full database and OS-level access",
-					Detail:   fmt.Sprintf("User '%s' authenticated as PostgreSQL superuser.", user),
-				}})
-			}
-		}
-		for _, f := range r.Findings {
-			if f.Severity == "CRITICAL" {
-				user := ""
-				if len(r.Credentials) > 0 {
-					user = r.Credentials[0].User
-				}
-				criticals = append(criticals, critHit{r.Host, r.Port, user, f})
-			}
-		}
-	}
-
 	sep := strings.Repeat("=", 70)
 	fmt.Printf("\n%s\n  SUMMARY\n%s\n", sep, sep)
-	fmt.Printf("    Targets scanned  : %d\n", len(results))
-	fmt.Printf("    Port open        : %d\n", open)
-	fmt.Printf("    Credentials hit  : %d\n", compromised)
-	fmt.Printf("    Critical findings: %d\n", len(criticals))
+	fmt.Printf("    Targets scanned  : %d\n", statsProcessed)
+	fmt.Printf("    Port open        : %d\n", statsOpen)
+	fmt.Printf("    Credentials hit  : %d\n", statsCompromised)
+	fmt.Printf("    Critical findings: %d\n", len(statsCriticals))
 
-	if len(criticals) > 0 {
+	if len(statsCriticals) > 0 {
 		fmt.Printf("\n%s\n  %s\n%s\n", sep, colorize("CRITICAL", "CRITICAL FINDINGS"), sep)
-		for _, c := range criticals {
+		for _, c := range statsCriticals {
 			fmt.Printf("  %s:%d  (%s)\n", c.host, c.port, c.user)
 			fmt.Printf("    %s %s\n", colorize("CRITICAL", "[CRITICAL]"), c.f.Title)
 			fmt.Printf("    %s\n\n", c.f.Detail)
-		}
-	}
-
-	if *outputFile != "" {
-		if err := saveJSON(results, *outputFile); err != nil {
-			fmt.Fprintf(os.Stderr, "[!] Failed to write JSON: %v\n", err)
-		} else {
-			fmt.Printf("[*] JSON report saved to: %s\n", *outputFile)
 		}
 	}
 
